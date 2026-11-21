@@ -33,6 +33,25 @@ def _date_cn(now: dt.datetime) -> str:
     return f"{now:%m-%d} 周{WEEKDAYS[now.weekday()]}"
 
 
+SKIPPED_FIELDS = ("id", "title", "title_key", "score", "final_score", "status", "first_seen")
+
+
+def _for_storage(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("status") != "skipped":
+        return row
+    return {key: row[key] for key in SKIPPED_FIELDS if key in row}
+
+
+def compact_store(cfg: dict[str, Any]) -> int:
+    path = _data_dir(cfg) / "papers.jsonl"
+    rows = store.read_jsonl(path)
+    before = path.stat().st_size if path.exists() else 0
+    store.write_jsonl(path, [_for_storage(row) for row in rows])
+    after = path.stat().st_size
+    print(f"papers.jsonl: {before / 1024:.1f} KB -> {after / 1024:.1f} KB，{len(rows)} 行")
+    return 0
+
+
 def _weekly_footer(rows: list[dict[str, Any]], today: str) -> str:
     start = (dt.date.fromisoformat(today) - dt.timedelta(days=6)).isoformat()
     sent = [
@@ -177,7 +196,9 @@ def run_daily(cfg: dict[str, Any], dry_run: bool = False, limit: int | None = No
         message, key, cfg["qmsg"]["endpoint"], int(cfg["qmsg"]["max_chars"])
     )
 
-    store.write_jsonl(data_dir / "papers.jsonl", rows)
+    store.write_jsonl(
+        data_dir / "papers.jsonl", [_for_storage(row) for row in rows]
+    )
     digest_dir = data_dir / "digests"
     digest_dir.mkdir(parents=True, exist_ok=True)
     (digest_dir / f"{today}.md").write_text(
@@ -296,12 +317,15 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只打印，不发送、不写状态")
     parser.add_argument("--limit", type=int, default=None, help="临时覆盖 top_n")
     parser.add_argument("--self-test", action="store_true", help="用本地 fixture 跑通链路")
+    parser.add_argument("--compact", action="store_true", help="压缩 papers.jsonl 中 skipped 行")
     parser.add_argument("--config", default=str(BASE_DIR / "config.toml"))
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
     if args.self_test:
         return self_test(cfg)
+    if args.compact:
+        return compact_store(cfg)
     if args.mode == "venue":
         print("venue 模式是 v1.5（USENIX proceedings），当前版本未实现。")
         return 0

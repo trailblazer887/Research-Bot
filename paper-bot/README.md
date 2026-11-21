@@ -43,6 +43,20 @@ python3 main.py --mode daily --dry-run --limit 3
 
 `--dry-run` 不写状态，可以反复跑。
 
+## 状态文件与仓库体积
+
+`data/papers.jsonl` 会记录所有候选（约 120 条/天），但 `skipped` 行只保留：
+
+```
+id / title / title_key / score / final_score / status / first_seen
+```
+
+一天约 30–40 KB；`sent` 和 `pool` 保留完整摘要（回填时要用）。历史数据可以手动压缩：
+
+```bash
+python3 main.py --compact
+```
+
 ## 关于依赖：不要直接 pip install 到系统 Python
 
 `requirements.txt` 里只有 `requests`，而且通常随系统 Python 已装好。Ubuntu 23.04+ / Debian 12+ 的系统 Python 是 PEP 668 “externally managed”，直接 `pip install` 会被拒绝；加 `--break-system-packages` 才是真的污染系统，不推荐。
