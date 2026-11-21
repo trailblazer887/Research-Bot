@@ -7,6 +7,8 @@ from typing import Any
 
 import requests
 
+from safety import SafeError, safe_error, sanitize_for_qmsg
+
 LABELS = [
     ("problem", "问题"),
     ("core_idea", "核心"),
@@ -93,32 +95,63 @@ def split_message(text: str, max_chars: int) -> list[str]:
     return result
 
 
+class QmsgError(SafeError):
+    """Qmsg 发送失败；消息已脱敏，不含 key / URL。"""
+
+
+def prepare_chunks(text: str, max_chars: int) -> list[str]:
+    """先整体消毒再切分，避免 URL 被切到两个 chunk 里漏检。"""
+    return split_message(sanitize_for_qmsg(text), max_chars)
+
+
+def send_chunk(
+    text: str, key: str, endpoint: str, index: int, total: int
+) -> object | None:
+    """发送一个 chunk，返回 Qmsg 的 msgId（可能为 None）。
+
+    只认 ``success is True``；响应不是 JSON 也算失败，避免把 502/HTML
+    当成“已发送”。异常文本一律经 ``safe_error``，不会带出 key。
+    """
+    body = text if total == 1 else f"({index}/{total})\n{text}"
+    body = sanitize_for_qmsg(body)
+    last_error: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                endpoint.format(key=key), data={"msg": body}, timeout=25
+            )
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except ValueError:
+                raise QmsgError("qmsg response is not JSON") from None
+
+            if not isinstance(data, dict) or data.get("success") is not True:
+                message = ""
+                code = None
+                if isinstance(data, dict):
+                    code = data.get("code")
+                    message = sanitize_for_qmsg(str(data.get("message", "")))[:80]
+                    if key:
+                        message = message.replace(key, "[key]")
+                raise QmsgError(f"qmsg rejected: code={code} {message}".strip())
+            return data.get("data")
+        except QmsgError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 网络错误统一重试
+            last_error = exc
+            if attempt < 2:
+                time.sleep(3.5 + attempt * 2)
+
+    raise QmsgError(f"qmsg send failed: {safe_error(last_error)}")
+
+
 def send_qmsg(text: str, key: str, endpoint: str, max_chars: int) -> None:
-    chunks = split_message(text, max_chars)
+    """用于错误通知等一次性消息；正常日报走 main 的发送日志。"""
+    chunks = prepare_chunks(text, max_chars)
     for index, chunk in enumerate(chunks, 1):
         if index > 1:
             # Qmsg 限流：同一 key 每 3 秒只能提交一次
             time.sleep(3.5)
-        body = chunk if len(chunks) == 1 else f"({index}/{len(chunks)})\n{chunk}"
-        last_error: Exception | None = None
-
-        for attempt in range(3):
-            try:
-                response = requests.post(
-                    endpoint.format(key=key), data={"msg": body}, timeout=25
-                )
-                response.raise_for_status()
-                try:
-                    data = response.json()
-                except ValueError:
-                    data = {}
-                if isinstance(data, dict) and data.get("success") is False:
-                    raise RuntimeError(f"qmsg rejected: {data}")
-                last_error = None
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                time.sleep(3.5 + attempt * 2)
-
-        if last_error:
-            raise RuntimeError(f"qmsg send failed: {last_error}")
+        send_chunk(chunk, key, endpoint, index, len(chunks))

@@ -44,6 +44,9 @@ jobs:
       - name: Self-test
         run: python main.py --self-test
 
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+
       - name: Resolve args
         id: args
         env:
@@ -75,5 +78,14 @@ jobs:
             echo "no state change"
           else
             git commit -m "chore: digest $(date -u +%F)"
-            git push
+            for attempt in 1 2 3; do
+              if git push; then
+                exit 0
+              fi
+              echo "push failed (attempt $attempt), rebasing"
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+              sleep 5
+            done
+            echo "state push failed after 3 attempts" >&2
+            exit 1
           fi

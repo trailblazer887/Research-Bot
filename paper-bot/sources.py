@@ -10,6 +10,8 @@ from xml.etree import ElementTree as ET
 
 import requests
 
+from safety import SafeError, safe_error
+
 ARXIV_API = "https://export.arxiv.org/api/query"
 NS = {"a": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 
@@ -102,7 +104,7 @@ def fetch_arxiv(cfg: dict[str, Any], now: dt.datetime | None = None) -> list[dic
         except Exception as exc:  # noqa: BLE001 - 网络/解析都要重试
             last_error = exc
 
-    raise RuntimeError(f"arXiv fetch failed after retries: {last_error}")
+    raise SafeError(f"arXiv fetch failed after retries: {safe_error(last_error)}")
 
 
 def _year_suffix(text: str) -> str | None:

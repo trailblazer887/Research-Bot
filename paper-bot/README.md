@@ -6,14 +6,17 @@
 
 ```
 arXiv（72h 窗口） → 去重 → LLM 给全部候选打分（会议 +1.5）
-→ Top 5 + 库存回填 → 结构化摘要 → 模板渲染 → Qmsg 推送
-→ data/papers.jsonl + data/digests/YYYY-MM-DD.md
+→ Top 5 + 库存回填 → 结构化摘要 → 模板渲染
+→ 写 sending 日志（分 chunk） → Qmsg 逐条推送并记录 msgId
+→ 写 papers.jsonl + data/digests/YYYY-MM-DD.md → 精简 last_run
 ```
 
 - **不做关键词过滤**：真实数据里 `watermark` 会命中视频水印、`swap` 会命中 SWaP / 量子纠缠、`reclaim` 会命中机器人项目，误报太多。每天约 130 篇候选全部交给 LLM 打分，成本仍然很低。
 - **会议优先**：`comment` / `journal_ref` 里带 ASPLOS、OSDI、ATC 等的论文加 1.5 分，消息里标 `[ASPLOS'26]`。
 - **不凑数**：不足 5 篇时从 14 天库存回填；仍不足就少发。
 - **反幻觉**：摘要先输出 JSON，再用模板渲染；`evidence` 里的数字会回查 abstract，对不上就降级。
+- **出站消毒**：发送前替换 URL、IPv4、5 位以上连续数字；错误通知只保留异常类型 / HTTP 状态 / host，不会带出 Qmsg key 或 URL。
+- **发送幂等**：每个 chunk 成功后就记录 msgId；同一天重跑直接跳过，发送中断后只补未发送的 chunk，已提交的不重发。
 - **无服务器**：GitHub Actions + JSONL，不需要数据库、VPS、Docker。
 
 ## 它不做什么（v1 边界）
@@ -32,6 +35,9 @@ python3 -c "import requests; print('requests', requests.__version__)"
 
 # 1) 不联网、不花钱，验证解析/渲染
 python3 main.py --self-test
+
+# 1b) 单元测试：消毒、异常脱敏、发送幂等/续发
+python3 -m unittest discover -s tests -t . -v
 
 # 2a) 联网抓取，只看抓到哪些（不配 LLM、不花钱、不发送）
 python3 main.py --mode daily --dry-run
@@ -57,6 +63,8 @@ id / title / title_key / score / final_score / status / first_seen
 python3 main.py --compact
 ```
 
+`data/last_run.json` 在发送期间是**投递日志**：包含当天的 chunks、每个 chunk 的 msgId、待落盘的论文行。成功后会被压缩成 `status=sent` 的小文件；发送失败则保留 `status=failed`，下一轮只补未发送的 chunk。正常跑完后它只有几行，失败时才会临时变大。
+
 ## 关于依赖：不要直接 pip install 到系统 Python
 
 `requirements.txt` 里只有 `requests`，而且通常随系统 Python 已装好。Ubuntu 23.04+ / Debian 12+ 的系统 Python 是 PEP 668 “externally managed”，直接 `pip install` 会被拒绝；加 `--break-system-packages` 才是真的污染系统，不推荐。
@@ -71,13 +79,14 @@ pip install -r requirements.txt
 
 `.venv/` 已在 `.gitignore` 里。GitHub Actions 的 `pip install` 跑在隔离的 runner 上，不影响本机。
 
-## Qmsg 的三个硬限制（重要）
+## Qmsg 的硬限制（重要）
 
 | 限制 | 影响 | 已经怎么处理 |
 |---|---|---|
 | 单条 ≤ **1800 字符** | 5 篇会拆成 2 条 | `max_chars = 1700`，尽量在论文边界拆 |
 | 同一 key **每 3 秒**只能推 1 次 | 连发第二条会被限流 | 两条之间自动 `sleep(3.5)` |
-| **禁止 URL / IPv4 / 连续数字** | **消息里不能放 arXiv 链接**，否则可能违规封号 | 默认 `include_url = false`；链接只保留在本地 `data/digests/*.md` |
+| **禁止 URL / IPv4 / 连续数字** | **消息里不能放 arXiv 链接**，否则可能违规封号 | 发送前 `sanitize_for_qmsg()` 替换；错误通知只保留类型/状态/host；默认 `include_url = false`，链接只保留在本地 `data/digests/*.md` |
+| 内容检测是异步的 | 返回成功不代表最终送达 | 记录 msgId；失败时保留 chunk 供续发，不整轮重来 |
 
 > 如果你一定要在 QQ 里点链接：换 NapCatQQ（自建，有封号风险）或 QQ 邮箱（SMTP，最稳），不要用编码/短链绕过 Qmsg 的检测。
 
@@ -144,7 +153,8 @@ user_agent = "paper-bot/1.0 (mailto:你的邮箱@example.com)"
 | QQ 没收到 | `QMSG_KEY` 错 / 没加机器人好友 | `curl -X POST "https://qmsg.zendee.cn/v3/send/$KEY" --data-urlencode "msg=test"` |
 | Actions 失败 | 缺 secret / arXiv 超时 / LLM 余额 | 看 Actions 日志；失败会发邮件（Settings → Notifications） |
 | LLM 400 | 兼容端点不支持 `response_format` | 把 `[llm] json_mode` 改成 `false` |
-| 重复推送 | `data/papers.jsonl` 没提交 | 检查 `git add paper-bot/data/` 和 `Persist state` 步骤 |
+| 重复推送 | 同日手动重跑 / 上次的 state 没提交 | 现在同日 `status=sent` 会跳过；发送中断会续发未提交的 chunk。若仍重复，检查 `last_run.json` 是否被 `Persist state` 提交 |
+| 只收到一半 | 第二条被限流或网络中断 | 看 `last_run.json` 的 `status=failed`；重新触发会只补未发送的 chunk |
 | 定时不触发 | 不在默认分支 / 仓库 60 天无提交 | 手动 Run 一次；脚本每天写 `last_run.json`，正常情况下不会停 |
 | 周一推送很少 | arXiv 周末不公告 | 正常，库存回填会补 |
 
@@ -155,7 +165,8 @@ user_agent = "paper-bot/1.0 (mailto:你的邮箱@example.com)"
 
 ## 合规
 
-- 只发摘要 + 链接，不转发 PDF。
+- QQ 只发摘要，不发 arXiv 链接（链接只写本地 `data/digests/*.md`）。
+- 发送前会替换 URL / IPv4 / 长数字；错误通知不含 Qmsg key。
 - Qmsg 是第三方服务，内容会经过它，不要推敏感信息。
 - 遵守 arXiv API 条款：请求间隔 ≥ 3 秒、User-Agent 带联系方式。
 
@@ -163,13 +174,14 @@ user_agent = "paper-bot/1.0 (mailto:你的邮箱@example.com)"
 
 ```
 paper-bot/
-├── main.py                 # 编排 + CLI
+├── main.py                 # 编排 + CLI + 投递日志
 ├── sources.py              # arXiv 抓取、会议识别、过滤
 ├── llm.py                  # 打分、摘要、数字校验
-├── notify.py               # 渲染、拆分、Qmsg
+├── notify.py               # 渲染、拆分、Qmsg、出站消毒
+├── safety.py               # 异常脱敏 + Qmsg 内容消毒
 ├── store.py                # JSONL 状态
 ├── config.toml
 ├── prompts/{score,summarize}.md
-├── tests/fixtures/arxiv_sample.xml
+├── tests/                  # unittest：消毒 / 脱敏 / 幂等续发
 └── data/                   # 运行后生成：papers.jsonl / last_run.json / digests/
 ```

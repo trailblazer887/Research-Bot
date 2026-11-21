@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 
+from safety import SafeError, safe_error
+
 PROMPT_DIR = Path(__file__).parent / "prompts"
 
 
@@ -63,7 +65,7 @@ def _chat(cfg: dict[str, Any], messages: list[dict[str, str]], api_key: str) -> 
             last_error = exc
             time.sleep(2)
 
-    raise RuntimeError(f"LLM request failed: {last_error}")
+    raise SafeError(f"LLM request failed: {safe_error(last_error)}")
 
 
 def score_papers(
@@ -108,7 +110,7 @@ def score_papers(
                     {"role": "user", "content": "只输出 JSON，不要解释。"}
                 ]
         else:
-            raise RuntimeError(f"score parse failed: {last_error}")
+            raise SafeError(f"score parse failed: {safe_error(last_error)}")
 
     return results
 
@@ -182,7 +184,7 @@ def summarize_paper(
                     "content": "上一次输出不是合法 JSON。只输出 JSON 对象，不要解释。",
                 }
             ]
-    raise RuntimeError(f"summary failed: {last_error}")
+    raise SafeError(f"summary failed: {safe_error(last_error)}")
 
 
 def fallback_summary(paper: dict[str, Any]) -> dict[str, Any]:

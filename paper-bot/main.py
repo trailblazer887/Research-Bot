@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import llm
 import notify
 import sources
 import store
+from safety import SafeError, safe_error
 
 BASE_DIR = Path(__file__).parent
 WEEKDAYS = "一二三四五六日"
@@ -52,6 +54,182 @@ def compact_store(cfg: dict[str, Any]) -> int:
     return 0
 
 
+def _last_run_path(cfg: dict[str, Any]) -> Path:
+    return _data_dir(cfg) / "last_run.json"
+
+
+def _digest_path(cfg: dict[str, Any], date: str) -> Path:
+    return _data_dir(cfg) / "digests" / f"{date}.md"
+
+
+def _merge_papers(cfg: dict[str, Any], papers: list[dict[str, Any]]) -> None:
+    path = _data_dir(cfg) / "papers.jsonl"
+    rows = store.read_jsonl(path)
+    by_id = {row["id"]: row for row in rows}
+    for paper in papers:
+        by_id[paper["id"]] = paper
+    store.write_jsonl(path, [_for_storage(row) for row in by_id.values()])
+
+
+def _finalize_delivery(cfg: dict[str, Any], journal: dict[str, Any]) -> None:
+    """把已确认发送的 journal 落成 papers.jsonl + 日报 + 精简 last_run。
+
+    可重复执行：发送成功但写状态失败时，下一轮会从这里补写，不会再发一次。
+    """
+    date = str(journal.get("date", ""))
+    papers = list(journal.get("papers", []))
+    _merge_papers(cfg, list(journal.get("new_papers", [])) + papers)
+
+    digest_text = str(journal.get("digest_text", ""))
+    digest = _digest_path(cfg, date)
+    if digest_text and date and not digest.exists():
+        store.write_text(digest, f"# {date} 日报\n\n{digest_text}\n")
+
+    stats = journal.get("stats") or {}
+    sent_count = (
+        len(papers) if papers else int(journal.get("sent_count", journal.get("sent", 0)))
+    )
+    msg_ids = [
+        chunk.get("msg_id")
+        for chunk in journal.get("chunks", [])
+        if chunk.get("sent")
+    ]
+    if not msg_ids:
+        msg_ids = list(journal.get("msg_ids", []))
+
+    store.write_json(
+        _last_run_path(cfg),
+        {
+            "at": journal.get("at", ""),
+            "date": date,
+            "mode": "daily",
+            "status": "sent",
+            "fetched": stats.get("fetched", journal.get("fetched", 0)),
+            "kept": stats.get("kept", journal.get("kept", 0)),
+            "sent": sent_count,
+            "sent_count": sent_count,
+            "msg_ids": [msg_id for msg_id in msg_ids if msg_id is not None],
+            "errors": [],
+        },
+    )
+
+
+def _send_journal(cfg: dict[str, Any], journal: dict[str, Any]) -> None:
+    """发送 journal 里尚未发送的 chunk；每成功一条就落一次盘。"""
+    key = os.getenv("QMSG_KEY", "").strip()
+    if not key:
+        raise SafeError("缺少 QMSG_KEY，无法发送或续发日报")
+
+    endpoint = cfg["qmsg"]["endpoint"]
+    chunks = journal.get("chunks", [])
+    total = len(chunks)
+    journal["status"] = "sending"
+    journal["error"] = ""
+    journal["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    store.write_json(_last_run_path(cfg), journal)
+
+    already = any(chunk.get("sent") or chunk.get("msg_id") for chunk in chunks)
+    try:
+        for index, chunk in enumerate(chunks, 1):
+            if chunk.get("sent") or chunk.get("msg_id"):
+                continue
+            if already:
+                # Qmsg 限流：同一 key 每 3 秒只能提交一次
+                time.sleep(3.5)
+            msg_id = notify.send_chunk(chunk["text"], key, endpoint, index, total)
+            chunk["sent"] = True
+            chunk["msg_id"] = msg_id
+            journal["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            store.write_json(_last_run_path(cfg), journal)
+            already = True
+    except Exception as exc:
+        journal["status"] = "failed"
+        journal["error"] = safe_error(exc)
+        journal["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        store.write_json(_last_run_path(cfg), journal)
+        raise
+
+    journal["status"] = "sent"
+    journal["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    store.write_json(_last_run_path(cfg), journal)
+    _finalize_delivery(cfg, journal)
+
+
+def _recover_stale(cfg: dict[str, Any], journal: dict[str, Any]) -> None:
+    """处理隔夜残留的 journal：已发送的补写，未发送的放弃或回填。"""
+    date = str(journal.get("date", ""))
+    if journal.get("status") == "abandoned":
+        return
+    if journal.get("status") == "sent":
+        _finalize_delivery(cfg, journal)
+        return
+
+    chunks = journal.get("chunks", [])
+    if chunks and all(chunk.get("sent") for chunk in chunks):
+        # 所有 chunk 都已提交，只是没来得及落 papers/digest
+        _finalize_delivery(cfg, journal)
+        return
+
+    papers = list(journal.get("papers", []))
+    delivered = any(
+        chunk.get("sent") or chunk.get("msg_id") for chunk in chunks
+    )
+    for paper in papers:
+        paper["status"] = "skipped" if delivered else "pool"
+        paper["digest_date"] = ""
+        paper["backfill"] = False
+    _merge_papers(cfg, list(journal.get("new_papers", [])) + papers)
+    print(
+        f"上一轮日报（{date}）未完成："
+        + ("部分已发送，剩余标记为已跳过" if delivered else "未发送，已放回库存")
+    )
+    stats = journal.get("stats") or {}
+    store.write_json(
+        _last_run_path(cfg),
+        {
+            "at": journal.get("at", ""),
+            "date": date,
+            "mode": "daily",
+            "status": "abandoned",
+            "fetched": stats.get("fetched", 0),
+            "kept": stats.get("kept", 0),
+            "sent": 0,
+            "errors": [journal.get("error", "")] if journal.get("error") else [],
+        },
+    )
+
+
+def _record_failure(cfg: dict[str, Any], exc: BaseException) -> None:
+    """失败时保留发送日志（用于续发），只写入脱敏后的错误。"""
+    path = _last_run_path(cfg)
+    journal = store.read_json(path, {})
+    now = dt.datetime.now(ZoneInfo(cfg["general"]["timezone"]))
+    today = now.date().isoformat()
+
+    if journal.get("date") == today and journal.get("status") in {"sending", "failed"}:
+        journal["status"] = "failed"
+        journal["error"] = safe_error(exc)
+        journal["updated_at"] = now.isoformat()
+        store.write_json(path, journal)
+        return
+    if journal.get("date") == today and journal.get("status") == "sent":
+        return
+
+    store.write_json(
+        path,
+        {
+            "at": now.isoformat(),
+            "date": today,
+            "mode": "daily",
+            "status": "failed",
+            "fetched": 0,
+            "kept": 0,
+            "sent": 0,
+            "errors": [safe_error(exc)],
+        },
+    )
+
+
 def _weekly_footer(rows: list[dict[str, Any]], today: str) -> str:
     start = (dt.date.fromisoformat(today) - dt.timedelta(days=6)).isoformat()
     sent = [
@@ -74,6 +252,27 @@ def run_daily(cfg: dict[str, Any], dry_run: bool = False, limit: int | None = No
     today = now.date().isoformat()
     data_dir = _data_dir(cfg)
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    last_run = store.read_json(_last_run_path(cfg), {})
+    if not dry_run:
+        if last_run.get("date") == today:
+            if last_run.get("status") == "sent":
+                _finalize_delivery(cfg, last_run)
+                print("今日日报已发送，跳过重复推送。")
+                return 0
+            if last_run.get("status") in {"sending", "failed"} and last_run.get(
+                "chunks"
+            ):
+                print("发现今日未完成的发送，续发剩余消息。")
+                _send_journal(cfg, last_run)
+                return 0
+        elif last_run.get("date"):
+            _recover_stale(cfg, last_run)
+            last_run = {}
+
+        if _digest_path(cfg, today).exists():
+            print("今日日报文件已存在，跳过（避免覆盖和重复推送）。")
+            return 0
 
     rows = store.read_jsonl(data_dir / "papers.jsonl")
     known_ids = {row["id"] for row in rows}
@@ -112,7 +311,7 @@ def run_daily(cfg: dict[str, Any], dry_run: bool = False, limit: int | None = No
                 print(f"  {paper['url']}")
             print("\n配置 LLM_API_KEY 后重跑，才能看到打分和摘要。")
             return 0
-        raise RuntimeError("缺少 LLM_API_KEY（本地调试可用 --dry-run）")
+        raise SafeError("缺少 LLM_API_KEY（本地调试可用 --dry-run）")
 
     scores = llm.score_papers(new_papers, cfg, api_key) if new_papers else {}
 
@@ -188,33 +387,29 @@ def run_daily(cfg: dict[str, Any], dry_run: bool = False, limit: int | None = No
 
     key = os.getenv("QMSG_KEY", "").strip()
     if not key:
-        raise RuntimeError("缺少 QMSG_KEY")
+        raise SafeError("缺少 QMSG_KEY")
     if not api_key:
-        raise RuntimeError("缺少 LLM_API_KEY（本地调试可用 --dry-run）")
+        raise SafeError("缺少 LLM_API_KEY（本地调试可用 --dry-run）")
 
-    notify.send_qmsg(
-        message, key, cfg["qmsg"]["endpoint"], int(cfg["qmsg"]["max_chars"])
-    )
-
-    store.write_jsonl(
-        data_dir / "papers.jsonl", [_for_storage(row) for row in rows]
-    )
-    digest_dir = data_dir / "digests"
-    digest_dir.mkdir(parents=True, exist_ok=True)
-    (digest_dir / f"{today}.md").write_text(
-        f"# {today} 日报\n\n{digest_text}\n", encoding="utf-8"
-    )
-    store.write_json(
-        data_dir / "last_run.json",
-        {
-            "at": now.isoformat(),
-            "mode": "daily",
-            "fetched": len(fetched),
-            "kept": len(qualified),
-            "sent": len(selected),
-            "errors": [],
-        },
-    )
+    chunks = notify.prepare_chunks(message, int(cfg["qmsg"]["max_chars"]))
+    journal = {
+        "at": now.isoformat(),
+        "date": today,
+        "mode": "daily",
+        "status": "sending",
+        "new_papers": new_papers,
+        "papers": selected,
+        "chunks": [
+            {"index": index, "text": chunk, "sent": False}
+            for index, chunk in enumerate(chunks, 1)
+        ],
+        "digest_text": digest_text,
+        "stats": stats,
+        "errors": [],
+    }
+    store.write_json(_last_run_path(cfg), journal)
+    _send_journal(cfg, journal)
+    print(f"已发送 {len(selected)} 篇。")
     return 0
 
 
@@ -333,10 +528,14 @@ def main() -> int:
     try:
         return run_daily(cfg, dry_run=args.dry_run, limit=args.limit)
     except Exception as exc:  # noqa: BLE001 - 顶层兜底，必须通知
-        message = f"【沙箱内存·每日】运行失败\n{type(exc).__name__}: {exc}"
+        message = f"【沙箱内存·每日】运行失败\n{safe_error(exc)}"
         print(message, file=sys.stderr)
 
         if not args.dry_run:
+            try:
+                _record_failure(cfg, exc)
+            except Exception:  # noqa: BLE001
+                pass
             key = os.getenv("QMSG_KEY", "").strip()
             if key:
                 try:
@@ -348,22 +547,6 @@ def main() -> int:
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            try:
-                store.write_json(
-                    _data_dir(cfg) / "last_run.json",
-                    {
-                        "at": dt.datetime.now(
-                            ZoneInfo(cfg["general"]["timezone"])
-                        ).isoformat(),
-                        "mode": args.mode,
-                        "fetched": 0,
-                        "kept": 0,
-                        "sent": 0,
-                        "errors": [f"{type(exc).__name__}: {exc}"],
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                pass
         return 1
 
 
