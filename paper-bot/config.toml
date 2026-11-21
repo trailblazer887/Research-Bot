@@ -1,0 +1,30 @@
+[general]
+timezone = "Asia/Shanghai"
+data_dir = "data"
+top_n = 5
+lookback_hours = 72
+min_final_score = 4.0
+backfill_days = 14
+
+[arxiv]
+categories = ["cs.OS", "cs.DC", "cs.PF", "cs.CR"]
+max_results = 400
+user_agent = "paper-bot/1.0 (mailto:you@example.com)"
+
+[venue]
+top = ["OSDI", "SOSP", "ASPLOS", "EuroSys", "ATC", "NSDI", "FAST", "VEE",
+       "SoCC", "HotOS", "MICRO", "ISCA", "HPCA", "PPoPP", "ICS", "MEMSYS", "SYSTOR"]
+boost = 1.5
+journal_boost = 1.0
+
+[llm]
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+temperature = 0.0
+timeout = 90
+json_mode = true
+
+[qmsg]
+endpoint = "https://qmsg.zendee.cn/v3/send/{key}"
+max_chars = 1700
+include_url = false

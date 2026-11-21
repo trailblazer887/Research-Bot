@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>ArXiv Query: fixture (fake data for self-test)</title>
+  <entry>
+    <id>http://arxiv.org/abs/2411.00001v1</id>
+    <title>Watermark-Aware Memory Reclaim for MicroVM Sandboxes</title>
+    <summary>MicroVM sandboxes hide guest memory from the host, so host-side reclaim often evicts the wrong pages. We present a two-level watermark controller that combines host PSI with guest free page reporting. On a 64-core server, it reduces p99 allocation latency by 23% and improves the memory overcommit ratio by 1.4x compared with memory.high alone.</summary>
+    <published>2026-11-20T12:00:00Z</published>
+    <author><name>Alice Zhang</name></author>
+    <author><name>Bob Li</name></author>
+    <arxiv:comment>Accepted by ASPLOS 2026</arxiv:comment>
+    <arxiv:primary_category term="cs.OS"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2411.00002v2</id>
+    <title>PSI-Guided Memory Offloading for Container Clusters</title>
+    <summary>Memory utilization is a poor signal for offloading because page cache inflates usage. We use PSI lost-work to decide how much anonymous memory to offload to zswap. In a 200-node cluster, total memory drops by 27% with no p99 regression.</summary>
+    <published>2026-11-20T09:30:00Z</published>
+    <author><name>Carol Wang</name></author>
+    <arxiv:comment>To appear in ATC 2026</arxiv:comment>
+    <arxiv:primary_category term="cs.DC"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2411.00003v1</id>
+    <title>A Survey of Federated Learning for Wireless Edge Networks</title>
+    <summary>Federated learning allows edge devices to train models without sharing raw data. This survey reviews privacy, communication cost, and wireless scheduling challenges in edge networks.</summary>
+    <published>2026-11-20T08:00:00Z</published>
+    <author><name>Dan Chen</name></author>
+    <arxiv:primary_category term="cs.LG"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2411.00004v1</id>
+    <title>CXL Tiering with Page Hotness Tracking</title>
+    <summary>Tiered memory needs cheap hotness tracking to place pages between DRAM and CXL. We describe a sampled access-bit scheme and a demotion policy that reserves headroom for new allocations. The prototype improves throughput by 18% over NUMA balancing on a 4-socket machine.</summary>
+    <published>2026-11-19T18:00:00Z</published>
+    <author><name>Eve Liu</name></author>
+    <arxiv:journal_ref>ACM Trans. Comput. Syst.</arxiv:journal_ref>
+    <arxiv:primary_category term="cs.AR"/>
+  </entry>
+</feed>
